@@ -1,3 +1,4 @@
+// Pokemon Snap port: this file is modified from upstream N64ModernRuntime; VENDORING.md lists the changes.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -194,16 +195,111 @@ bool write_file(const std::filesystem::path& path, const std::vector<uint8_t>& d
     return true;
 }
 
-bool check_stored_rom(const recomp::GameEntry& game_entry) {
-    std::vector stored_rom_data = read_file(config_path / game_entry.stored_filename());
+const std::array<uint8_t, 4> first_rom_bytes { 0x80, 0x37, 0x12, 0x40 };
 
-    if (!check_hash(stored_rom_data, game_entry.rom_hash)) {
-        // Incorrect hash, remove the stored ROM file if it exists.
-        std::filesystem::remove(config_path / game_entry.stored_filename());
-        return false;
+enum class ByteswapType {
+    NotByteswapped,
+    Byteswapped4,
+    Byteswapped2,
+    Invalid
+};
+
+ByteswapType check_rom_start(const std::vector<uint8_t>& rom_data) {
+    if (rom_data.size() < 4) {
+        return ByteswapType::Invalid;
     }
 
-    return true;
+    auto check_match = [&](uint8_t index0, uint8_t index1, uint8_t index2, uint8_t index3) {
+        return
+            rom_data[0] == first_rom_bytes[index0] &&
+            rom_data[1] == first_rom_bytes[index1] &&
+            rom_data[2] == first_rom_bytes[index2] &&
+            rom_data[3] == first_rom_bytes[index3];
+    };
+
+    // Check if the ROM is already in the correct byte order.
+    if (check_match(0,1,2,3)) {
+        return ByteswapType::NotByteswapped;
+    }
+
+    // Check if the ROM has been byteswapped in groups of 4 bytes.
+    if (check_match(3,2,1,0)) {
+        return ByteswapType::Byteswapped4;
+    }
+
+    // Check if the ROM has been byteswapped in groups of 2 bytes.
+    if (check_match(1,0,3,2)) {
+        return ByteswapType::Byteswapped2;
+    }
+
+    // No match found.
+    return ByteswapType::Invalid;
+}
+
+void byteswap_data(std::vector<uint8_t>& rom_data, size_t index_xor) {
+    for (size_t rom_pos = 0; rom_pos < rom_data.size(); rom_pos += 4) {
+        uint8_t temp0 = rom_data[rom_pos + 0];
+        uint8_t temp1 = rom_data[rom_pos + 1];
+        uint8_t temp2 = rom_data[rom_pos + 2];
+        uint8_t temp3 = rom_data[rom_pos + 3];
+
+        rom_data[rom_pos + (0 ^ index_xor)] = temp0;
+        rom_data[rom_pos + (1 ^ index_xor)] = temp1;
+        rom_data[rom_pos + (2 ^ index_xor)] = temp2;
+        rom_data[rom_pos + (3 ^ index_xor)] = temp3;
+    }
+}
+
+// Reads a ROM image into memory in the byte order the runtime uses (big-endian,
+// the .z64 order). Byteswapped (.v64) and little-endian (.n64) dumps are put in
+// that order in memory only; the file on disk is never written to.
+static recomp::RomValidationError read_rom_file(const std::filesystem::path& rom_path, std::vector<uint8_t>& rom_data) {
+    rom_data = read_file(rom_path);
+
+    if (rom_data.empty()) {
+        return recomp::RomValidationError::FailedToOpen;
+    }
+
+    // Pad the rom to the nearest multiple of 4 bytes.
+    rom_data.resize((rom_data.size() + 3) & ~3);
+
+    switch (check_rom_start(rom_data)) {
+        case ByteswapType::Invalid:
+            return recomp::RomValidationError::NotARom;
+        case ByteswapType::Byteswapped2:
+            byteswap_data(rom_data, 1);
+            break;
+        case ByteswapType::Byteswapped4:
+            byteswap_data(rom_data, 3);
+            break;
+        case ByteswapType::NotByteswapped:
+            break;
+    }
+
+    return recomp::RomValidationError::Good;
+}
+
+// Checks the ROM at config_path / stored_filename(). In this port that file is
+// the player's own dump, placed there by hand (select_rom, which would copy a
+// chosen file into that spot, has no caller), so it is only ever read: whatever
+// is wrong with it is reported by the caller, and the file is never removed or
+// rewritten. On IncorrectRom, actual_hash is the hash of the byte-order
+// normalized image so the report can show it next to the expected one.
+recomp::RomValidationError check_stored_rom(const recomp::GameEntry& game_entry, uint64_t& actual_hash) {
+    std::vector<uint8_t> stored_rom_data;
+    recomp::RomValidationError error = read_rom_file(config_path / game_entry.stored_filename(), stored_rom_data);
+
+    if (error != recomp::RomValidationError::Good) {
+        return error;
+    }
+
+    actual_hash = XXH3_64bits(stored_rom_data.data(), stored_rom_data.size());
+
+    if (actual_hash != game_entry.rom_hash) {
+        return recomp::RomValidationError::IncorrectRom;
+    }
+
+    return recomp::RomValidationError::Good;
 }
 
 static std::unordered_set<std::u8string> valid_game_roms;
@@ -214,9 +310,60 @@ bool recomp::is_rom_valid(const std::u8string& game_id) {
 
 void recomp::check_all_stored_roms() {
     for (const auto& cur_rom_entry: game_roms) {
-        if (check_stored_rom(cur_rom_entry.second)) {
+        const recomp::GameEntry& game_entry = cur_rom_entry.second;
+        std::filesystem::path rom_path = config_path / game_entry.stored_filename();
+        uint64_t actual_hash = 0;
+        recomp::RomValidationError error = check_stored_rom(game_entry, actual_hash);
+
+        if (error == recomp::RomValidationError::Good) {
             valid_game_roms.insert(cur_rom_entry.first);
+            printf("[Recomp] ROM " PATHFMT ": ok (hash %016" PRIX64 ")\n", rom_path.c_str(), actual_hash);
+            continue;
         }
+
+        // Name the exact failure. Missing, unreadable, not a ROM and wrong dump
+        // each call for a different fix, and a wrong dump is only diagnosable
+        // with both hashes in front of the player.
+        auto hex64 = [](uint64_t value) {
+            char buf[17];
+            snprintf(buf, sizeof(buf), "%016" PRIX64, value);
+            return std::string(buf);
+        };
+        std::string problem;
+        switch (error) {
+            case recomp::RomValidationError::FailedToOpen: {
+                std::error_code ec;
+                if (std::filesystem::exists(rom_path, ec)) {
+                    problem = "The file exists but could not be read.";
+                }
+                else {
+                    problem = "The file does not exist.";
+                }
+                break;
+            }
+            case recomp::RomValidationError::NotARom:
+                problem = "The file is not an N64 ROM: its first bytes match none of the .z64, .v64 or .n64 byte orders.";
+                break;
+            default:
+                problem = "The file is an N64 ROM, but not the expected one.\nExpected hash: " + hex64(game_entry.rom_hash) +
+                    "\nThis file's hash: " + hex64(actual_hash) + " (XXH3-64 of the image in big-endian byte order)";
+                break;
+        }
+
+        printf("[Recomp] ROM " PATHFMT ": %s\n", rom_path.c_str(), problem.c_str());
+        fflush(stdout);
+
+        // This is what the player sees; stdout is not visible on the launch
+        // path they use. The callback that draws the dialog is registered
+        // before this runs (see recomp::start).
+        std::u8string rom_path_u8 = rom_path.u8string();
+        std::ostringstream message;
+        message << "Could not load the ROM for " << game_entry.internal_name << ".\n\n"
+            << "Expected file:\n" << reinterpret_cast<const char*>(rom_path_u8.c_str()) << "\n\n"
+            << problem << "\n\n"
+            << "Big-endian (.z64), byteswapped (.v64) and little-endian (.n64) dumps are all accepted under that filename. "
+            << "Fix the file and start the game again.";
+        ultramodern::error_handling::message_box(message.str().c_str());
     }
 }
 
@@ -227,11 +374,14 @@ bool recomp::load_stored_rom(const std::u8string& game_id) {
         return false;
     }
     
-    std::vector<uint8_t> stored_rom_data = read_file(config_path / find_it->second.stored_filename());
+    std::vector<uint8_t> stored_rom_data;
+    if (read_rom_file(config_path / find_it->second.stored_filename(), stored_rom_data) != recomp::RomValidationError::Good) {
+        return false;
+    }
 
+    // The file is the player's own; if it changed since check_all_stored_roms
+    // accepted it, the caller reports the failure and the file is left alone.
     if (!check_hash(stored_rom_data, find_it->second.rom_hash)) {
-        // The ROM no longer has the right hash, delete it.
-        std::filesystem::remove(config_path / find_it->second.stored_filename());
         return false;
     }
 
@@ -302,61 +452,6 @@ bool recomp::Version::from_string(const std::string& str, Version& out) {
     return true;
 }
 
-const std::array<uint8_t, 4> first_rom_bytes { 0x80, 0x37, 0x12, 0x40 };
-
-enum class ByteswapType {
-    NotByteswapped,
-    Byteswapped4,
-    Byteswapped2,
-    Invalid
-};
-
-ByteswapType check_rom_start(const std::vector<uint8_t>& rom_data) {
-    if (rom_data.size() < 4) {
-        return ByteswapType::Invalid;
-    }
-
-    auto check_match = [&](uint8_t index0, uint8_t index1, uint8_t index2, uint8_t index3) {
-        return
-            rom_data[0] == first_rom_bytes[index0] &&
-            rom_data[1] == first_rom_bytes[index1] &&
-            rom_data[2] == first_rom_bytes[index2] &&
-            rom_data[3] == first_rom_bytes[index3];
-    };
-
-    // Check if the ROM is already in the correct byte order.
-    if (check_match(0,1,2,3)) {
-        return ByteswapType::NotByteswapped;
-    }
-
-    // Check if the ROM has been byteswapped in groups of 4 bytes.
-    if (check_match(3,2,1,0)) {
-        return ByteswapType::Byteswapped4;
-    }
-
-    // Check if the ROM has been byteswapped in groups of 2 bytes.
-    if (check_match(1,0,3,2)) {
-        return ByteswapType::Byteswapped2;
-    }
-
-    // No match found.
-    return ByteswapType::Invalid;
-}
-
-void byteswap_data(std::vector<uint8_t>& rom_data, size_t index_xor) {
-    for (size_t rom_pos = 0; rom_pos < rom_data.size(); rom_pos += 4) {
-        uint8_t temp0 = rom_data[rom_pos + 0];
-        uint8_t temp1 = rom_data[rom_pos + 1];
-        uint8_t temp2 = rom_data[rom_pos + 2];
-        uint8_t temp3 = rom_data[rom_pos + 3];
-
-        rom_data[rom_pos + (0 ^ index_xor)] = temp0;
-        rom_data[rom_pos + (1 ^ index_xor)] = temp1;
-        rom_data[rom_pos + (2 ^ index_xor)] = temp2;
-        rom_data[rom_pos + (3 ^ index_xor)] = temp3;
-    }
-}
-
 recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_path, const std::u8string& game_id) {
     auto find_it = game_roms.find(game_id);
 
@@ -366,28 +461,11 @@ recomp::RomValidationError recomp::select_rom(const std::filesystem::path& rom_p
 
     const recomp::GameEntry& game_entry = find_it->second;
 
-    std::vector<uint8_t> rom_data = read_file(rom_path);
+    std::vector<uint8_t> rom_data;
+    recomp::RomValidationError read_error = read_rom_file(rom_path, rom_data);
 
-    if (rom_data.empty()) {
-        return recomp::RomValidationError::FailedToOpen;
-    }
-
-    // Pad the rom to the nearest multiple of 4 bytes.
-    rom_data.resize((rom_data.size() + 3) & ~3);
-
-    ByteswapType byteswap_type = check_rom_start(rom_data);
-
-    switch (byteswap_type) {
-        case ByteswapType::Invalid:
-            return recomp::RomValidationError::NotARom;
-        case ByteswapType::Byteswapped2:
-            byteswap_data(rom_data, 1);
-            break;
-        case ByteswapType::Byteswapped4:
-            byteswap_data(rom_data, 3);
-            break;
-        case ByteswapType::NotByteswapped:
-            break;
+    if (read_error != recomp::RomValidationError::Good) {
+        return read_error;
     }
 
     if (!check_hash(rom_data, game_entry.rom_hash)) {
@@ -474,9 +552,25 @@ std::optional<std::u8string> current_game = std::nullopt;
 std::atomic<GameStatus> game_status = GameStatus::None;
 
 void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t arg) {
-    auto find_it = game_roms.find(current_game.value());
-    const recomp::GameEntry& game_entry = find_it->second;
-    
+    // Pokemon Snap port: a pooled game thread can start after quit() has
+    // cleared current_game, and current_game.value() then threw on the way
+    // out. The game's entry is read under the lock quit() takes, and a game
+    // that is gone starts no thread. Found by DramaticShape's VR fork
+    // (prismaticShape/Snap64RecompVR), fixed the same way there.
+    const recomp::GameEntry* registered_game = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(current_game_mutex);
+        if (!current_game) {
+            return;
+        }
+        auto found = game_roms.find(*current_game);
+        if (found == game_roms.end()) {
+            return;
+        }
+        registered_game = &found->second;
+    }
+    const recomp::GameEntry& game_entry = *registered_game;
+
     recomp_context ctx{};
     ctx.r29 = sp;
     ctx.r4 = arg;
@@ -496,7 +590,10 @@ void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
     recomp::overlays::init_overlays();
 
     // Load overlays in the first 1MB
-    load_overlays(0x1000, (int32_t)entrypoint, 1024 * 1024);
+    // Pokemon Snap: only .main (rom 0x1000, size 0x45270) is ROM-contiguous from
+    // the entrypoint. The rest of the 1MB window maps to different VRAMs and is
+    // registered by the dmaLoadOverlay hook in src/overlay_hook.cpp instead.
+    load_overlays(0x1000, (int32_t)entrypoint, 0x45270);
 
     // Initial 1MB DMA (rom address 0x1000 = physical address 0x10001000)
     recomp::do_rom_read(rdram, entrypoint, 0x10001000, 0x100000);
@@ -897,8 +994,6 @@ void parse_cli(int argc, char **argv) {
 void recomp::start(const recomp::Configuration& cfg) {
     project_version = cfg.project_version;
 
-    recomp::check_all_stored_roms();
-
     recomp::rsp::set_callbacks(cfg.rsp_callbacks);
 
     static const ultramodern::rsp::callbacks_t ultramodern_rsp_callbacks {
@@ -907,6 +1002,9 @@ void recomp::start(const recomp::Configuration& cfg) {
     };
 
     ultramodern::set_callbacks(ultramodern_rsp_callbacks, cfg.renderer_callbacks, cfg.audio_callbacks, cfg.input_callbacks, cfg.gfx_callbacks, cfg.events_callbacks, cfg.error_handling_callbacks, cfg.threads_callbacks);
+
+    // After the callbacks so a failed check can reach the message_box callback.
+    recomp::check_all_stored_roms();
 
     ultramodern::gfx_callbacks_t gfx_callbacks = cfg.gfx_callbacks;
 
@@ -967,7 +1065,9 @@ void recomp::start(const recomp::Configuration& cfg) {
     recomp::mods::register_config_exports();
     recomp::mods::register_hook_exports();
 
-    std::thread game_thread{[](ultramodern::renderer::WindowHandle window_handle, uint8_t* rdram) {
+    // The game's first thread runs its boot, so it gets the game's stack
+    // (ultramodern::threads::make_game_host_thread).
+    std::thread game_thread = ultramodern::threads::make_game_host_thread([window_handle, rdram]() {
         debug_printf("[Recomp] Starting\n");
 
         ultramodern::set_native_thread_name("Game Start Thread");
@@ -978,7 +1078,7 @@ void recomp::start(const recomp::Configuration& cfg) {
 
         // Loop until the game starts.
         while (!wait_for_game_started(rdram, &context)) {}
-    }, window_handle, rdram};
+    });
 
     parse_cli(cfg.argc, cfg.argv);
 
@@ -992,9 +1092,16 @@ void recomp::start(const recomp::Configuration& cfg) {
     graphics_shutdown_ready.signal();
 
     game_thread.join();
+    // The saving thread comes down before the event threads, not after. It
+    // waits for the game's write burst to go quiet so that a save is never
+    // published half-written, and join_event_threads takes down the VI and
+    // graphics threads -- the ones that deliver retrace messages to guest
+    // threads. Joined in the old order, that wait could be spent behind a
+    // guest thread blocked on a queue nothing was left alive to feed, so the
+    // grace expired and the save was dropped for want of a message.
+    ultramodern::join_saving_thread();
     ultramodern::join_event_threads();
     ultramodern::join_thread_cleaner_thread();
-    ultramodern::join_saving_thread();
     
     // Free rdram.
     bool free_failed;

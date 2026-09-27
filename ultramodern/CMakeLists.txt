@@ -1,3 +1,4 @@
+# Pokemon Snap port: modified from upstream N64ModernRuntime; VENDORING.md lists the changes.
 cmake_minimum_required(VERSION 3.20)
 
 project(ultramodern)
@@ -30,12 +31,12 @@ target_include_directories(ultramodern PUBLIC
     "${PROJECT_SOURCE_DIR}/../thirdparty/sse2neon"
 )
 
-target_compile_options(ultramodern PRIVATE
-#    -Wall
-#    -Wextra
-    -Wno-unused-parameter
-)
+if (NOT MSVC)
+    target_compile_options(ultramodern PRIVATE -Wno-unused-parameter)
+endif()
 
 if (WIN32)
     add_compile_definitions(NOMINMAX)
 endif()
+
+

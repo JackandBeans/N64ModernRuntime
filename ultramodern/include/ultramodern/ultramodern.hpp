@@ -37,6 +37,9 @@ void init_saving(RDRAM_ARG1);
 void init_events(RDRAM_ARG renderer::WindowHandle window_handle);
 void init_timers(RDRAM_ARG1);
 void init_thread_cleanup();
+// Pokemon Snap port: park this many pooled host threads ahead of demand,
+// so the first course's spawn bursts find workers already breathing.
+void prewarm_thread_pool(uint32_t count);
 
 // Saving
 void change_save_file(const std::u8string& subfolder, const std::u8string& name);
@@ -84,6 +87,13 @@ void resume_thread_and_wait(RDRAM_ARG OSThread* t);
 void schedule_running_thread(RDRAM_ARG PTR(OSThread) t);
 void cleanup_thread(UltraThreadContext* thread_context);
 struct thread_terminated : std::exception {};
+// Pokemon Snap port: code made at run time -- a mod's own functions, or a
+// game or patch function recompiled live for a mod's hook -- has no unwind
+// information, so thread_terminated cannot unwind through it. librecomp
+// registers each block of it here, and a thread that ends with one on its
+// stack returns to its entry without unwinding (threads.cpp).
+void register_generated_code(const void* begin, size_t size);
+void unregister_generated_code(const void* begin);
 
 enum class ThreadPriority {
     Low,
@@ -102,6 +112,13 @@ bool is_game_thread();
 void submit_rsp_task(RDRAM_ARG PTR(OSTask) task);
 void send_si_message();
 uint32_t get_speed_multiplier();
+// Pokemon Snap port: from the call on, the game's clocks (the counter,
+// osGetTime, the OS timers, the VI retraces) run at num/den times the wall
+// clock; 1/1 is the console's speed, 3/1 fast forward, 1/2 slow motion.
+// Any thread.
+void set_speed_ratio(uint32_t num, uint32_t den);
+void get_speed_ratio(uint32_t& num, uint32_t& den);
+void set_speed_multiplier(uint32_t multiplier);   // set_speed_ratio(multiplier, 1)
 
 // Time
 std::chrono::high_resolution_clock::time_point get_start();

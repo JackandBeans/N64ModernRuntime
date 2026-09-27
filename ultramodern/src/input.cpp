@@ -1,3 +1,4 @@
+// Pokemon Snap port: this file is modified from upstream N64ModernRuntime; VENDORING.md lists the changes.
 #include <cassert>
 #include <cmath>
 
@@ -173,7 +174,13 @@ extern "C" void osContGetReadData(OSContPad *data) {
         }
 
         if (got_response) {
-            convert_to_n64_range(x, y, data[controller].stick_x, data[controller].stick_y);
+            // Pokemon Snap port: the linear mapping the port's mouse, gyro and
+            // keyboard values are scaled for (src/input.cpp) and its replays
+            // were recorded against. Upstream's octagonal gate above
+            // (convert_to_n64_range) is left unused here; a physical stick's
+            // gate is the port's to apply, as a choice, in its own layer.
+            data[controller].stick_x = (int8_t)(127 * x);
+            data[controller].stick_y = (int8_t)(127 * y);
 
             data[controller].button = buttons;
             data[controller].err_no = 0;

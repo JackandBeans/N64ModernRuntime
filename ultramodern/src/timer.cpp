@@ -1,3 +1,5 @@
+// Pokemon Snap port: this file is modified from upstream N64ModernRuntime; VENDORING.md lists the changes.
+#include <mutex>
 #include <thread>
 #include <variant>
 #include <set>
@@ -15,10 +17,25 @@
 static std::chrono::high_resolution_clock::time_point start_time = std::chrono::high_resolution_clock::now();
 // Offset of the duration since program start used to calculate the value for osGetTime. 
 static int64_t ostime_offset = 0;
-// Game speed multiplier (1 means no speedup)
-constexpr uint32_t speed_multiplier = 1;
-// N64 CPU counter ticks per millisecond
-constexpr uint32_t counter_per_ms = 46'875 * speed_multiplier;
+// N64 CPU counter ticks per millisecond, at the console's own speed.
+constexpr uint32_t counter_per_ms = 46'875;
+// Game speed, as a ratio of the console's (1/1 means no change). Pokemon Snap
+// port: set while the program runs (set_speed_ratio, held by the player's
+// fast-forward or slow-motion key: 3/1, 1/2), so every clock the game can
+// read -- this counter, osGetTime, the OS timers and the VI retraces in
+// events.cpp -- runs at that ratio of the wall clock. The game sees a faster
+// or slower console and nothing else. The counter is piecewise linear: a
+// change rebases it on the instant of the change, so it never jumps and
+// never runs backwards.
+// Pokemon Snap port: never destroyed, as the pool's objects in threads.cpp:
+// the timer thread is detached and still runs while the process's globals
+// are destroyed (macOS threw on the lock, and the thread's queue below was
+// freed under it: a crash report at every quit, found 2026-09-26).
+static std::mutex& clock_mutex = *new std::mutex();
+static uint32_t speed_num = 1;
+static uint32_t speed_den = 1;
+static uint64_t clock_base_ticks = 0;                                               // the counter at the last change
+static std::chrono::high_resolution_clock::time_point clock_base_time = start_time; // the instant of the last change
 
 struct OSTimer {
     PTR(OSTimer) unused1;
@@ -39,31 +56,43 @@ struct RemoveTimerAction {
 
 using Action = std::variant<AddTimerAction, RemoveTimerAction>;
 
-struct {
+struct TimerContext {
     std::thread thread;
     moodycamel::BlockingConcurrentQueue<Action> action_queue{};
-} timer_context;
+};
+// Pokemon Snap port: never destroyed (see clock_mutex above).
+static TimerContext& timer_context = *new TimerContext();
 
-uint64_t duration_to_ticks(std::chrono::high_resolution_clock::duration duration) {
+// Counts at num/den times the console's rate over a wall-clock span.
+uint64_t duration_to_ticks(std::chrono::high_resolution_clock::duration duration, uint32_t num, uint32_t den) {
     uint64_t delta_micros = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
     // More accurate than using a floating point timer, will only overflow after running for 12.47 years
+    // (at 1x; the counter is rebased at every speed change, so a span here is one speed's)
     // Units: (micros * (counts/millis)) / (micros/millis) = counts
-    uint64_t total_count = (delta_micros * counter_per_ms) / 1000;
+    uint64_t total_count = (delta_micros * counter_per_ms * num) / (1000 * den);
 
     return total_count;
 }
 
-std::chrono::microseconds ticks_to_duration(uint64_t ticks) {
+std::chrono::microseconds ticks_to_duration(uint64_t ticks, uint32_t num, uint32_t den) {
     using namespace std::chrono_literals;
-    return ticks * 1000us / counter_per_ms;
+    return ticks * 1000us * den / (counter_per_ms * num);
 }
 
+// The wall-clock instant a counter value falls on, at the speed in force. A
+// timer set before a speed change is not recomputed: it fires where the old
+// speed put it, at most one of its own periods off.
 std::chrono::high_resolution_clock::time_point ticks_to_timepoint(uint64_t ticks) {
-    return start_time + ticks_to_duration(ticks);
+    std::lock_guard lock{ clock_mutex };
+    if (ticks < clock_base_ticks) {
+        return clock_base_time - ticks_to_duration(clock_base_ticks - ticks, speed_num, speed_den);
+    }
+    return clock_base_time + ticks_to_duration(ticks - clock_base_ticks, speed_num, speed_den);
 }
 
 uint64_t time_now() {
-    return duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
+    std::lock_guard lock{ clock_mutex };
+    return clock_base_ticks + duration_to_ticks(std::chrono::high_resolution_clock::now() - clock_base_time, speed_num, speed_den);
 }
 
 void timer_thread(RDRAM_ARG1) {
@@ -146,7 +175,38 @@ void ultramodern::init_timers(RDRAM_ARG1) {
 }
 
 uint32_t ultramodern::get_speed_multiplier() {
-    return speed_multiplier;
+    std::lock_guard lock{ clock_mutex };
+    return (speed_den == 1) ? speed_num : 1;
+}
+
+void ultramodern::get_speed_ratio(uint32_t& num, uint32_t& den) {
+    std::lock_guard lock{ clock_mutex };
+    num = speed_num;
+    den = speed_den;
+}
+
+void ultramodern::set_speed_ratio(uint32_t num, uint32_t den) {
+    if (num == 0) {
+        num = 1;
+    }
+    if (den == 0) {
+        den = 1;
+    }
+    std::lock_guard lock{ clock_mutex };
+    if ((num == speed_num) && (den == speed_den)) {
+        return;
+    }
+    // Rebase: the counter keeps its value at this instant and runs at the
+    // new rate from here on.
+    const auto now = std::chrono::high_resolution_clock::now();
+    clock_base_ticks += duration_to_ticks(now - clock_base_time, speed_num, speed_den);
+    clock_base_time = now;
+    speed_num = num;
+    speed_den = den;
+}
+
+void ultramodern::set_speed_multiplier(uint32_t multiplier) {
+    set_speed_ratio(multiplier, 1);
 }
 
 std::chrono::high_resolution_clock::time_point ultramodern::get_start() {
@@ -219,6 +279,33 @@ void ultramodern::sleep_until(const std::chrono::high_resolution_clock::time_poi
         // printf("Sleeping %lld %d ms\n", delta_ms, (uint32_t)delta_ms);
         Sleep(delta_ms);
     }
+}
+
+#elif defined(__APPLE__)
+
+#include <mach/mach_time.h>
+
+void ultramodern::sleep_milliseconds(uint32_t millis) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{millis});
+}
+
+// Snap64 Recomp: the kernel's own deadline wait, on the clock that
+// high_resolution_clock reads on macOS (mach_absolute_time). With the
+// time-constraint policy the VI and timer threads take (threads.cpp,
+// set_native_thread_priority) it wakes within microseconds even on a
+// virtual Mac, where std::this_thread::sleep_until woke 61 ms late.
+void ultramodern::sleep_until(const std::chrono::high_resolution_clock::time_point& time_point) {
+    const auto now = std::chrono::high_resolution_clock::now();
+    if (time_point <= now) {
+        return;
+    }
+    static const mach_timebase_info_data_t timebase = [] {
+        mach_timebase_info_data_t t{};
+        mach_timebase_info(&t);
+        return t;
+    }();
+    const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(time_point - now).count());
+    mach_wait_until(mach_absolute_time() + ns * timebase.denom / timebase.numer);
 }
 
 #else

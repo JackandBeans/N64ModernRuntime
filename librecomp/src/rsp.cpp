@@ -53,9 +53,14 @@ bool recomp::rsp::run_task(uint8_t* rdram, const OSTask* task) {
 
     // Ensure that the ucode exited correctly
     if (exit_reason != RspExitReason::Broke) {
-        fprintf(stderr, "RSP ucode %" PRIu32 " exited unexpectedly. exit_reason: %i\n", task->t.type, static_cast<int>(exit_reason));
-        assert(exit_reason == RspExitReason::Broke);
-        return false;
+        // Pokemon Snap port: a malformed audio frame is dropped rather than
+        // fatal; log and carry on so boot can proceed.
+        static int rsp_fail_count = 0;
+        if (rsp_fail_count < 8) {
+            fprintf(stderr, "RSP ucode %" PRIu32 " exited unexpectedly (reason %i); dropping frame\n", task->t.type, static_cast<int>(exit_reason));
+            rsp_fail_count++;
+        }
+        return true;
     }
 
     return true;

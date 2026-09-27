@@ -1,5 +1,7 @@
 #include <bitset>
 #include <thread>
+#include <atomic>
+#include <chrono>
 
 #include "blockingconcurrentqueue.h"
 
@@ -11,6 +13,9 @@ struct QueuedMessage {
     OSMesg mesg;
     bool jam;
     bool requeue_if_blocked;
+    // Pokemon Snap port: a retrace or an audio tick, the messages the VI
+    // thread posts on a clock. See dequeue_external_messages.
+    bool periodic;
 };
 
 static moodycamel::BlockingConcurrentQueue<QueuedMessage> external_messages {};
@@ -28,11 +33,12 @@ void ultramodern::set_message_queue_control(const ultramodern::MessageQueueContr
 }
 
 void ultramodern::enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src) {
-    external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)]});
+    const bool periodic = (src == EventMessageSource::Vi) || (src == EventMessageSource::Ai);
+    external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)], periodic});
 }
 
 void ultramodern::enqueue_external_message(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, bool requeue_if_blocked) {
-    external_messages.enqueue({mq, msg, jam, requeue_if_blocked});
+    external_messages.enqueue({mq, msg, jam, requeue_if_blocked, false});
 }
 
 bool do_send(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, bool jam, bool block);
@@ -41,6 +47,26 @@ void dequeue_external_messages(RDRAM_ARG1) {
     QueuedMessage to_send;
     std::vector<QueuedMessage> requeued_messages{};
     while (external_messages.try_dequeue(to_send)) {
+        // Pokemon Snap port: a periodic message -- a retrace, an audio tick --
+        // never takes the last free slot of its queue. These pile up here
+        // while a game thread sits in host code (a controller driver's
+        // handshake, issue #7) and are all delivered at that thread's next OS
+        // call, ahead of whatever that call itself sends. The console never
+        // has more than one such interrupt pending, and its scheduler thread
+        // services each before the next, so no game queue is ever filled by
+        // them; filled here, the game's own non-blocking send that follows
+        // the drain fails -- scExecuteBlocking waits forever for the answer
+        // to a task that was never queued -- and the boot stops on a black
+        // window. The slot kept free is the least that keeps that send
+        // alive; the retraces dropped for it are the ones a full queue
+        // dropped anyway. Queues of one slot are left alone: there the rule
+        // would drop every message.
+        if (to_send.periodic) {
+            OSMesgQueue* mq = TO_PTR(OSMesgQueue, to_send.mq);
+            if ((mq->msgCount >= 2) && (mq->validCount + 1 >= mq->msgCount)) {
+                continue;
+            }
+        }
         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
             requeued_messages.push_back(to_send);
         }
@@ -50,9 +76,17 @@ void dequeue_external_messages(RDRAM_ARG1) {
     }
 }
 
+// Pokemon Snap port: the per-guest-thread run clock (threads.cpp) must not
+// bill these blocking host dequeues as running -- this is where the game
+// waits for vblank.
+extern "C" void snap_run_clock_pause();
+extern "C" void snap_run_clock_resume();
+
 void ultramodern::wait_for_external_message(RDRAM_ARG1) {
     QueuedMessage to_send;
+    snap_run_clock_pause();
     external_messages.wait_dequeue(to_send);
+    snap_run_clock_resume();
     if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
         external_messages.enqueue(to_send);
     }
@@ -60,7 +94,10 @@ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
 
 void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
     QueuedMessage to_send;
-    if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
+    snap_run_clock_pause();
+    const bool got = external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis});
+    snap_run_clock_resume();
+    if (got) {
         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
             external_messages.enqueue(to_send);
         }
@@ -175,7 +212,48 @@ extern "C" s32 osSendMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags)
 
     // Try to send the message.
     bool sent = do_send(PASS_RDRAM mq_, msg, jam, flags == OS_MESG_BLOCK);
-    
+
+    // Pokemon Snap port: a message the game sent without blocking and the
+    // queue had no room for is gone, and the game never learns it. Some
+    // queues are meant to work that way -- one- and two-slot queues used as
+    // flags, where "full" means "already signalled" -- but the scheduler's
+    // task queue is not: the game sends every graphics task into it without
+    // blocking and then waits for the completion, so a drop there is a
+    // frozen picture with the music still playing (issue #7 at boot; the
+    // Volcano freeze at the shutter). Report the first two drops of each
+    // queue, for the first dozen queues, with enough to name queue and
+    // sender; the flag queues cost two lines each and nothing more.
+    if (!sent) {
+        static uint32_t seenQueues[12] = {};
+        static int seenDrops[12] = {};
+        static int seenCount = 0;
+        int slot = -1;
+        for (int i = 0; i < seenCount; i++) {
+            if (seenQueues[i] == (uint32_t)mq_) { slot = i; break; }
+        }
+        if ((slot < 0) && (seenCount < 12)) {
+            slot = seenCount++;
+            seenQueues[slot] = (uint32_t)mq_;
+        }
+        if ((slot >= 0) && (seenDrops[slot] < 2)) {
+            seenDrops[slot]++;
+            // A game thread always has a self here (the send from any other
+            // thread went to the external queue above); the check costs
+            // nothing and TO_PTR of a null offset is not null.
+            const PTR(OSThread) self = ultramodern::this_thread();
+            OSThread *t = (self != NULLPTR) ? TO_PTR(OSThread, self) : nullptr;
+            // A queue of one or two slots is a flag: full means already
+            // signalled, and the drop is the game's own design. Said so,
+            // since these two lines appear in every log.
+            printf("[SNAP-OS] osSendMesg dropped a message: queue 0x%08X full (%d of %d), msg 0x%08X, from thread %d (pri %d)%s%s\n",
+                   (uint32_t)mq_, (int)mq->validCount, (int)mq->msgCount, (uint32_t)msg,
+                   t ? (int)t->id : -1, t ? (int)t->priority : -1,
+                   (mq->msgCount <= 2) ? " -- a flag queue, expected" : "",
+                   (seenDrops[slot] == 2) ? " -- this queue's further drops not reported" : "");
+            fflush(stdout);
+        }
+    }
+
     // Check the queue to see if this thread should swap execution to another.
     ultramodern::check_running_queue(PASS_RDRAM1);
 
@@ -204,6 +282,26 @@ extern "C" s32 osJamMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, s32 flags) 
     return sent ? 0 : -1;
 }
 
+// Pokemon Snap port: time THIS game thread spent blocked waiting for a
+// message. Per-thread on purpose: several game threads are blocked at the
+// same time and their waits overlap in wall-clock, so a total across all of
+// them routinely exceeds the frame it is meant to describe. Only the thread
+// that owns the frame can say how much of that frame it spent waiting.
+static thread_local int64_t snap_tls_recv_nanos = 0;
+static thread_local uint32_t snap_tls_recv_count = 0;
+
+extern "C" int64_t snap_recv_block_take_nanos() {
+    const int64_t taken = snap_tls_recv_nanos;
+    snap_tls_recv_nanos = 0;
+    return taken;
+}
+
+extern "C" uint32_t snap_recv_block_take_count() {
+    const uint32_t taken = snap_tls_recv_count;
+    snap_tls_recv_count = 0;
+    return taken;
+}
+
 extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 flags) {
     OSMesgQueue *mq = TO_PTR(OSMesgQueue, mq_);
     
@@ -212,8 +310,22 @@ extern "C" s32 osRecvMesg(RDRAM_ARG PTR(OSMesgQueue) mq_, PTR(OSMesg) msg_, s32 
     // Handle any messages that have been received from an external thread.
     dequeue_external_messages(PASS_RDRAM1);
 
+    // Pokemon Snap port: a blocking receive is where a game thread waits --
+    // for the video retrace that paces the whole game, for the audio thread,
+    // for another process. Wall-clock spent here is the game being PACED, not
+    // the game being slow, and without separating the two a frame report
+    // cannot tell a heavy tick from a late signal.
+    const bool snapBlocking = (flags == OS_MESG_BLOCK);
+    const auto snapRecvStart = snapBlocking ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
     // Try to receive a message.
     bool received = do_recv(PASS_RDRAM mq_, msg_, flags == OS_MESG_BLOCK);
+
+    if (snapBlocking) {
+        snap_tls_recv_nanos += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - snapRecvStart).count();
+        snap_tls_recv_count++;
+    }
     
     // Check the queue to see if this thread should swap execution to another.
     ultramodern::check_running_queue(PASS_RDRAM1);

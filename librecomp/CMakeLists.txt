@@ -1,3 +1,4 @@
+# Pokemon Snap port: modified from upstream N64ModernRuntime; VENDORING.md lists the changes.
 cmake_minimum_required(VERSION 3.20)
 
 project(librecomp)
@@ -50,11 +51,10 @@ target_include_directories(librecomp PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include/librecomp"
 )
 
-target_compile_options(librecomp PRIVATE
-#    -Wall
-#    -Wextra
-    -Wno-unused-parameter
-)
+if (NOT MSVC)
+    target_compile_options(librecomp PRIVATE -Wno-unused-parameter)
+endif()
+set_target_properties(librecomp PROPERTIES C_STANDARD 11)
 
 if (WIN32)
     add_compile_definitions(NOMINMAX)
@@ -65,3 +65,6 @@ add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/
 
 target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
 target_link_libraries(librecomp PUBLIC miniz)
+
+
+

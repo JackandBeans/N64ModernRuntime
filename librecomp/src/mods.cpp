@@ -8,6 +8,7 @@
 #include "librecomp/overlays.hpp"
 #include "librecomp/game.hpp"
 #include "librecomp/patcher.hpp"
+#include "ultramodern/ultramodern.hpp"
 #include "recompiler/context.h"
 #include "recompiler/live_recompiler.h"
 
@@ -513,6 +514,11 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
         std::ostringstream dummy_ostream{};
 
         if (!N64Recomp::recompile_function_live(generator, context, func_index, dummy_ostream, dummy_static_funcs, true)) {
+            // Pokemon Snap port: the loader reports only "Code mod loading
+            // internal error"; the log says which function.
+            printf("[SNAP-MODS] live recompilation failed at function %zu (vram 0x%08X)\n",
+                func_index, context.functions[func_index].vram);
+            fflush(stdout);
             errored = true;
             break;
         }
@@ -521,6 +527,37 @@ recomp::mods::LiveRecompilerCodeHandle::LiveRecompilerCodeHandle(
     // Generate the code.
     recompiler_output = std::make_unique<N64Recomp::LiveGeneratorOutput>(generator.finish());
     is_good = !errored && recompiler_output->good;
+
+    // Pokemon Snap port: a thread cannot unwind through this code, so
+    // ultramodern is told where it is (ultramodern.hpp, register_generated_code).
+    // sljit's default allocator maps code once, so it runs where it was
+    // written; a function outside that block (a twice-mapped build) gets a
+    // block of its own from where the functions start.
+    if (recompiler_output->code != nullptr) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(recompiler_output->code);
+        const uintptr_t end = begin + recompiler_output->code_size;
+        uintptr_t lowest = UINTPTR_MAX;
+        for (recomp_func_t* func : recompiler_output->functions) {
+            const uintptr_t at = reinterpret_cast<uintptr_t>(func);
+            if (func != nullptr && (at < begin || at >= end) && at < lowest) {
+                lowest = at;
+            }
+        }
+        ultramodern::register_generated_code(recompiler_output->code, recompiler_output->code_size);
+        if (lowest != UINTPTR_MAX) {
+            generated_elsewhere = reinterpret_cast<const void*>(lowest);
+            ultramodern::register_generated_code(generated_elsewhere, recompiler_output->code_size);
+        }
+    }
+}
+
+recomp::mods::LiveRecompilerCodeHandle::~LiveRecompilerCodeHandle() {
+    if (recompiler_output != nullptr && recompiler_output->code != nullptr) {
+        ultramodern::unregister_generated_code(recompiler_output->code);
+    }
+    if (generated_elsewhere != nullptr) {
+        ultramodern::unregister_generated_code(generated_elsewhere);
+    }
 }
 
 void recomp::mods::LiveRecompilerCodeHandle::set_imported_function(size_t import_index, GenericFunction func) {
@@ -1032,10 +1069,12 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
 
     bool mods_loaded = active_game != (size_t)-1;
 
-    // Do nothing if mods have already been loaded and this mod isn't runtime toggleable.
-    if (!mod.is_runtime_toggleable() && mods_loaded) {
-        return;
-    }
+    // Pokemon Snap port: a mod whose content cannot change while it is loaded
+    // (code, loaded before the game runs) takes the change for the next start
+    // instead of refusing it, below. Upstream returned here, which suits a
+    // launcher that toggles mods before the game starts; this port's Mods page
+    // is inside the game, and says the change applies at the next start.
+    bool deferred = !mod.is_runtime_toggleable() && mods_loaded;
 
     // Do nothing if mods have already been loaded and this mod isn't for the active game.
     if (mods_loaded && !mod.is_for_game(active_game)) {
@@ -1044,6 +1083,23 @@ void recomp::mods::ModContext::enable_mod(const std::string& mod_id, bool enable
 
     // Do nothing if this mod was deprecated.
     if (is_mod_deprecated(mod.manifest.mod_id, mod.manifest.version)) {
+        return;
+    }
+
+    if (deferred) {
+        // The set is what the save writes and the next load reads; nothing
+        // that is running reads it, and the loaded content is left as it is
+        // (no callbacks). The dependencies of what is enabled are worked out
+        // again by the next load from the saved list.
+        if (enabled) {
+            enabled_mods.emplace(mod_id);
+        }
+        else {
+            enabled_mods.erase(mod_id);
+        }
+        if (trigger_save) {
+            mod_configuration_thread_queue.enqueue(ModConfigQueueSave());
+        }
         return;
     }
 
@@ -2055,6 +2111,9 @@ std::unique_ptr<recomp::mods::LiveRecompilerCodeHandle> apply_regenlist(Regenera
     std::string reference_syms_error_param{};
     CodeModLoadError reference_syms_error = regenerated_code_handle->populate_reference_symbols(hook_context, reference_syms_error_param);
     if (reference_syms_error != CodeModLoadError::Good) {
+        // Pokemon Snap port: what the "internal error" was.
+        printf("[SNAP-MODS] a hooked function calls one the runtime cannot find (%s)\n", reference_syms_error_param.c_str());
+        fflush(stdout);
         return {};
     }
 
