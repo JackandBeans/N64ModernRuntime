@@ -2468,6 +2468,15 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t* 
         }
     }
 
+    // Snap64 Recomp: a mod is N64 code only. A mod that declares a native
+    // library is refused whole, so nothing a mod carries can run on the
+    // computer outside the recompiled code and the functions the runtime
+    // exposes to it.
+    if (!mod.manifest.native_libraries.empty()) {
+        error_param = mod.manifest.native_libraries.front().name;
+        return CodeModLoadError::NativeLibrariesRefused;
+    }
+
     // Load any native libraries specified by the mod and validate/register the expors.
     std::filesystem::path parent_path = mod.manifest.mod_root_path.parent_path();
     for (const recomp::mods::NativeLibraryManifest& cur_lib_manifest: mod.manifest.native_libraries) {

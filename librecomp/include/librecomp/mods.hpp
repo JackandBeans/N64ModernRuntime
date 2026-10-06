@@ -113,6 +113,7 @@ namespace recomp {
             MissingDependencyInManifest,
             FailedToLoadNativeCode,
             FailedToLoadNativeLibrary,
+            NativeLibrariesRefused,
             FailedToFindNativeExport,
             FailedToRecompile,
             InvalidReferenceSymbol,
