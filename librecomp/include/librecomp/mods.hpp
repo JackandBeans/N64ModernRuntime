@@ -114,6 +114,7 @@ namespace recomp {
             FailedToLoadNativeCode,
             FailedToLoadNativeLibrary,
             NativeLibrariesRefused,
+            OfflineModRefused,
             FailedToFindNativeExport,
             FailedToRecompile,
             InvalidReferenceSymbol,

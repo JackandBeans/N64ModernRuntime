@@ -2429,7 +2429,14 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::load_mod_code(uint8_t* 
     // Use a dynamic library code handle. This feature isn't meant to be used by end users, but provides a more debuggable
     // experience than the live recompiler for mod developers.
     // Enabled if the mod's filename ends with ".offline.nrm".
+    // Snap64 Recomp: refused. An offline-recompiled mod is a native library
+    // beside the .nrm, opened on the computer; mods are N64 code only, and
+    // every mod goes through the live recompiler.
     if (mod.manifest.mod_root_path.filename().string().ends_with(".offline.nrm")) {
+        error_param = mod.manifest.mod_root_path.filename().string();
+        return CodeModLoadError::OfflineModRefused;
+    }
+    if (false) {
         // Hooks can't be generated for native mods, so return an error if any of the functions this mod replaces are also hooked by another mod.
         if (!entry_func_hooks.empty() || !return_func_hooks.empty()) {
             return CodeModLoadError::OfflineModHooked;

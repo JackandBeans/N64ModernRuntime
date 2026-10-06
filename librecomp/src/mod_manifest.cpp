@@ -1105,6 +1105,8 @@ std::string recomp::mods::error_to_string(CodeModLoadError error) {
             return "Failed to load mod library";
         case CodeModLoadError::NativeLibrariesRefused:
             return "Mod declares a native library; mods are N64 code only";
+        case CodeModLoadError::OfflineModRefused:
+            return "Offline-recompiled mod would load native code; mods are N64 code only";
         case CodeModLoadError::FailedToFindNativeExport:
             return "Failed to find native export";
         case CodeModLoadError::FailedToRecompile:
