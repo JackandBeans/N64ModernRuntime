@@ -624,6 +624,20 @@ namespace recomp {
         void register_hook_exports();
         void run_hook(uint8_t* rdram, recomp_context* ctx, size_t hook_slot_index);
 
+        // Pokemon Snap port: functions whose compiled form carries the host's own work (a
+        // wrapper around the game's code, a call placed inside it, a rewritten instruction).
+        // A hook on one of these must not regenerate it from the ROM, which would drop that
+        // work; the host's copy runs the hook slots itself, through host_hook_slot and run_hook.
+        constexpr size_t host_hook_none = static_cast<size_t>(-1);     // no mod hooks it
+        constexpr size_t host_hook_pending = static_cast<size_t>(-2);  // the mods are not loaded yet
+        void mark_host_hooked_function(uint32_t section_rom, uint32_t function_vram);
+        bool is_host_hooked_function(uint32_t section_rom, uint32_t function_vram);
+        void set_host_hook_slot(const HookDefinition& def, size_t hook_slot_index);
+        size_t host_hook_slot(uint32_t section_rom, uint32_t function_vram, bool at_return);
+        void host_hooks_loading();
+        void host_hooks_loaded();
+        void reset_host_hooks();
+
         ModOpenError parse_manifest(ModManifest &ret, const std::vector<char> &manifest_data, std::string &error_param, recomp::config::Config *config = nullptr);
         CodeModLoadError validate_api_version(uint32_t api_version, std::string& error_param);
 

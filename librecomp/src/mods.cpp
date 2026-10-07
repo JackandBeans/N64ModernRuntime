@@ -1632,6 +1632,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
     ram_used = 0;
     num_events = recomp::overlays::num_base_events();
     loaded_code_mods.clear();
+    recomp::mods::host_hooks_loading();
 
     std::span<const uint8_t> decompressed_rom{};
 
@@ -1850,7 +1851,14 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
     std::vector<std::pair<recomp::mods::HookDefinition, size_t>> unprocessed_hooks;
     for (const auto& [def, index] : hook_slots) {
         if (!processed_hook_slots[index]) {
-            unprocessed_hooks.emplace_back(std::make_pair(def, index));
+            // Pokemon Snap port: a function the host instruments keeps its compiled form;
+            // the host's copy runs this slot itself (host_hook_slot).
+            if (recomp::mods::is_host_hooked_function(def.section_rom, def.function_vram)) {
+                recomp::mods::set_host_hook_slot(def, index);
+            }
+            else {
+                unprocessed_hooks.emplace_back(std::make_pair(def, index));
+            }
         }
         recomp::mods::set_hook_type(index, def.at_return);
     }
@@ -1879,6 +1887,7 @@ std::vector<recomp::mods::ModLoadErrorDetails> recomp::mods::ModContext::load_mo
 
     finish_event_setup(*this);
     finish_hook_setup(*this);
+    recomp::mods::host_hooks_loaded();
 
     active_game = mod_game_index;
     return ret;
@@ -2726,6 +2735,7 @@ void recomp::mods::ModContext::unload_mods() {
     shim_functions.clear();
     recomp::mods::reset_events();
     recomp::mods::reset_hooks();
+    recomp::mods::reset_host_hooks();
     num_events = recomp::overlays::num_base_events();
     active_game = (size_t)-1;
 }

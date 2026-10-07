@@ -1,3 +1,6 @@
+#include <atomic>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "librecomp/mods.hpp"
 #include "librecomp/overlays.hpp"
@@ -153,4 +156,58 @@ void recomp::mods::register_hook_exports() {
     REGISTER_FUNC(recomphook_get_return_u64);
     REGISTER_FUNC(recomphook_get_return_float);
     REGISTER_FUNC(recomphook_get_return_double);
+}
+
+// Pokemon Snap port. The host wraps some of the game's functions in compiled code of its own
+// (tools/hook_funcs.py): a hook on one of those must not replace it with a fresh copy of the
+// ROM's code, as regenerate_with_hooks would, because the copy has none of the host's work.
+// The host declares them before the mods load; a hook slot on one is recorded here instead of
+// regenerated, and the host's own copy of the function asks for it and runs it.
+namespace {
+    uint64_t host_key(uint32_t section_rom, uint32_t function_vram) {
+        return (uint64_t(section_rom) << 32) | uint64_t(function_vram);
+    }
+    std::unordered_set<uint64_t> host_hooked_functions{};
+    std::unordered_map<uint64_t, size_t> host_entry_slots{};
+    std::unordered_map<uint64_t, size_t> host_return_slots{};
+    // False while the slots are being set up: a caller sees host_hook_pending and asks again.
+    std::atomic<bool> host_hooks_final{false};
+}
+
+void recomp::mods::mark_host_hooked_function(uint32_t section_rom, uint32_t function_vram) {
+    host_hooked_functions.insert(host_key(section_rom, function_vram));
+}
+
+bool recomp::mods::is_host_hooked_function(uint32_t section_rom, uint32_t function_vram) {
+    return host_hooked_functions.contains(host_key(section_rom, function_vram));
+}
+
+void recomp::mods::set_host_hook_slot(const HookDefinition& def, size_t hook_slot_index) {
+    auto& slots = def.at_return ? host_return_slots : host_entry_slots;
+    slots[host_key(def.section_rom, def.function_vram)] = hook_slot_index;
+}
+
+size_t recomp::mods::host_hook_slot(uint32_t section_rom, uint32_t function_vram, bool at_return) {
+    if (!host_hooks_final.load(std::memory_order_acquire)) {
+        return host_hook_pending;
+    }
+    const auto& slots = at_return ? host_return_slots : host_entry_slots;
+    const auto it = slots.find(host_key(section_rom, function_vram));
+    return (it == slots.end()) ? host_hook_none : it->second;
+}
+
+void recomp::mods::host_hooks_loading() {
+    host_hooks_final.store(false, std::memory_order_release);
+    host_entry_slots.clear();
+    host_return_slots.clear();
+}
+
+void recomp::mods::host_hooks_loaded() {
+    host_hooks_final.store(true, std::memory_order_release);
+}
+
+void recomp::mods::reset_host_hooks() {
+    host_entry_slots.clear();
+    host_return_slots.clear();
+    host_hooks_final.store(true, std::memory_order_release);
 }
